@@ -1,0 +1,19 @@
+{
+  "domain": "home_ems",
+  "name": "Home EMS week planner",
+  "after_dependencies": [
+    "frontend",
+    "http"
+  ],
+  "codeowners": ["@appelbier"],
+  "dependencies": [
+    "recorder"
+  ],
+  "documentation": "https://github.com/appelbier/home-ems",
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/appelbier/home-ems/issues",
+  "requirements": [
+    "numpy>=1.26.0"
+  ],
+  "version": "0.4.0"
+}

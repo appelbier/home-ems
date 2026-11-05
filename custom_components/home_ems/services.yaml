@@ -1,0 +1,198 @@
+add_manual_slot:
+  name: Add manual slot
+  description: >-
+    Force a battery mode for a period. Give start + end for a one-off slot,
+    or weekdays + start_time + end_time for a weekly recurring slot.
+  fields:
+    mode:
+      name: Mode
+      required: true
+      example: charge
+      selector:
+        select:
+          options:
+            - charge
+            - export
+            - hold
+            - self_consumption
+    power_kw:
+      name: Power
+      description: Battery charge/export power in kW (default = max power).
+      example: 5
+      selector:
+        number:
+          min: 0
+          max: 50
+          step: 0.1
+          unit_of_measurement: kW
+    start:
+      name: Start
+      example: "2026-11-01 02:00:00"
+      selector:
+        datetime:
+    end:
+      name: End
+      example: "2026-11-01 05:00:00"
+      selector:
+        datetime:
+    weekdays:
+      name: Weekdays
+      description: For recurring slots, e.g. sat, sun.
+      example: "sat,sun"
+      selector:
+        select:
+          multiple: true
+          options:
+            - mon
+            - tue
+            - wed
+            - thu
+            - fri
+            - sat
+            - sun
+    start_time:
+      name: Start time
+      example: "02:00"
+      selector:
+        time:
+    end_time:
+      name: End time
+      example: "05:00"
+      selector:
+        time:
+    name:
+      name: Name
+      example: Weekend top-up
+      selector:
+        text:
+
+remove_manual_slot:
+  name: Remove manual slot
+  fields:
+    id:
+      name: ID
+      description: ID from the add response or the Manual slots sensor.
+      required: true
+      selector:
+        text:
+
+clear_manual_slots:
+  name: Clear manual slots
+  fields:
+    include_yaml:
+      name: Include YAML slots
+      description: Also remove slots from configuration.yaml (until restart).
+      default: false
+      selector:
+        boolean:
+
+add_heavy_load:
+  name: Add heavy load
+  description: >-
+    Tell the planner about an extra consumer. Fixed: start. Recurring:
+    weekdays + start_time. Flexible: earliest + latest, the planner picks the
+    cheapest start (see the Heavy loads sensor).
+  fields:
+    name:
+      name: Name
+      required: true
+      example: Sauna
+      selector:
+        text:
+    power_kw:
+      name: Power
+      required: true
+      example: 6
+      selector:
+        number:
+          min: 0.1
+          max: 50
+          step: 0.1
+          unit_of_measurement: kW
+    duration_min:
+      name: Duration
+      required: true
+      example: 90
+      selector:
+        number:
+          min: 5
+          max: 1440
+          unit_of_measurement: min
+    start:
+      name: Start
+      selector:
+        datetime:
+    weekdays:
+      name: Weekdays
+      selector:
+        select:
+          multiple: true
+          options:
+            - mon
+            - tue
+            - wed
+            - thu
+            - fri
+            - sat
+            - sun
+    start_time:
+      name: Start time
+      selector:
+        time:
+    earliest:
+      name: Earliest start
+      selector:
+        datetime:
+    latest:
+      name: Finished by
+      selector:
+        datetime:
+
+remove_heavy_load:
+  name: Remove heavy load
+  fields:
+    id:
+      name: ID
+      required: true
+      selector:
+        text:
+
+clear_heavy_loads:
+  name: Clear heavy loads
+  fields:
+    include_yaml:
+      name: Include YAML loads
+      default: false
+      selector:
+        boolean:
+
+recalculate:
+  name: Recalculate
+  description: Run the planner now.
+
+refresh_forecasts:
+  name: Refresh forecasts
+  description: Fetch prices and Solcast now (uses a Solcast API call when the API is used directly).
+
+exclude_load_history:
+  name: Exclude load history
+  description: >-
+    Keep a period out of the house load model, e.g. while a simulator fed fake
+    meter values. The period stays excluded when history is re-read from the recorder.
+  fields:
+    start:
+      name: Start
+      required: true
+      example: "2026-10-29 08:00:00"
+      selector:
+        datetime:
+    end:
+      name: End
+      required: true
+      example: "2026-10-29 18:00:00"
+      selector:
+        datetime:
+
+clear_load_exclusions:
+  name: Clear load exclusions
+  description: Forget all excluded periods; they are re-read from the recorder statistics.

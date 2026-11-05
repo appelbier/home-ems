@@ -1,0 +1,219 @@
+# Home EMS for: Deye SUN-30K-SG02HP3 (ESPHome remote-mode firmware) + 144 kWh battery,
+# 6.4 kWp PV (Solcast integration), Webasto Next via OCPP, Zonneplan dynamic prices.
+# Entity ids are taken from your ESPHome config and Predbat apps.yaml; lines marked
+# VERIFY could not be checked from here.
+#
+# Run it next to Predbat at first: keep control.enabled false (plan only) and compare.
+# Before enabling control, disable Predbat's inverter control so the two don't fight
+# over select.deye_30k_ems_mode: set switch.predbat_set_read_only on AND disable the
+# Predbat charge/export automations (they also set Idle on "Charge End" / "Demand").
+
+home_ems:
+  plan_days: 7
+  update_interval: 5
+
+  battery:
+    capacity_kwh: 144                     # Predbat soc_max
+    soc_entity: sensor.deye_30k_battery_soc
+    max_charge_kw: 15                     # firmware caps the setpoint at max_power_w = 15 kW
+    # Battery -> house in Idle (the inverter's own zero-export self use): the sub panel
+    # is fused 3 x 40 A C = 27.6 kW, the inverter does 30 kW. Grid export stays at 15 kW
+    # (grid.export_limit_kw and the firmware's 5 kW per phase limiter).
+    max_discharge_kw: 27
+    max_export_kw: 15                     # forced Discharge setpoint, firmware max_power_w
+    charge_efficiency: 0.96
+    discharge_efficiency: 0.96
+    reserve_soc_pct: 20                   # Predbat battery_min_soc
+    # hold_soc_pct: 40                    # normally keep at least this much (soft)
+    # hold_cost: 0.10                     # EUR per kWh per day below the hold level
+    max_soc_pct: 100
+    cycle_cost: 0.01
+
+  grid:
+    import_limit_kw: 15                   # 3 x 25 A, matches grid_limit_phase_w 5000 W x 3
+    export_limit_kw: 15                   # Predbat inverter_limit_export
+    allow_curtail: true
+
+  prices:
+    # Zonneplan quarter-hour tariffs for today/tomorrow, read the same way as your
+    # EnergyAnalyser app: forecast[].start_date and price_tax_included.amount (1e-7 EUR/kWh).
+    source:
+      entity: sensor.zonneplan_current_quarter_hourly_electricity_tariff
+      attributes: [forecast]
+      time_key: start_date
+      value_key: price_tax_included.amount
+      scale: 0.0000001
+      includes_tax: true
+    # Alternative: the Octopus-style template you made for Predbat.
+    # source:
+    #   entity: sensor.zonneplan_rates_for_predbat
+    #   includes_tax: true
+
+    # Forecast beyond the day-ahead prices. Home EMS fits it to the real Zonneplan
+    # prices it overlaps; the last good forecast is stored and survives restarts.
+    # Days it does not cover (or covers with a flat placeholder) fall back to the
+    # weekday history model. With several sources the first one wins where they overlap.
+    forecasts:
+      # EPEX Predictor (open source, free public API, also used by evcc): NL day-ahead
+      # forecast for ~7 days from weather forecasts. Raw EPEX prices excl. tax.
+      - name: epexpredictor
+        url: "https://epexpredictor.batzill.com/prices?region=NL&unit=EUR_PER_KWH&timezone=Europe/Amsterdam"
+        unit: eur_kwh
+        includes_tax: false
+        refresh_minutes: 180
+    # Seeds the weekday price model with 4 weeks of hourly statistics, so the
+    # weekend/weekday pattern is known from day one instead of after a month.
+    history_source:
+      entity: sensor.zonneplan_current_quarter_hourly_electricity_tariff   # VERIFY: state in EUR/kWh
+      includes_tax: true
+      unit: auto
+    vat_pct: 21
+    energy_tax: 0.0916                    # VERIFY: 2026 energiebelasting excl. VAT
+    import_markup: 0.02                   # VERIFY: Zonneplan fee excl. VAT (only matters after salderen)
+    # Salderen ends 1 Jan 2027: until then export earns the import price, after
+    # that the raw day-ahead price minus export_fee.
+    net_metering_until: "2027-01-01"
+    export_mode: raw
+    export_fee: 0.0                       # VERIFY: Zonneplan feed-in fee from 2027
+    forecast_margin: 0.01
+
+  solar:
+    solcast_entities:
+      - sensor.solcast_pv_forecast_forecast_today
+      - sensor.solcast_pv_forecast_forecast_tomorrow
+      - sensor.solcast_pv_forecast_forecast_day_3
+      - sensor.solcast_pv_forecast_forecast_day_4
+      - sensor.solcast_pv_forecast_forecast_day_5
+      - sensor.solcast_pv_forecast_forecast_day_6
+      - sensor.solcast_pv_forecast_forecast_day_7
+
+  load:
+    # ESPHome "Total load consumption" (kWh, total_increasing, 0.1 kWh resolution).
+    # The recorder's 5-minute statistics give the 15 minute load history.
+    energy_entity: sensor.deye_30k_total_load_consumption
+    # If the Webasto is on a circuit the Deye load measurement includes, subtract it:
+    subtract_entities:
+      - sensor.charger_energy_active_import_register         # VERIFY: OCPP charger id "charger"
+    history_days: 28
+    default_daily_kwh: 15
+
+  ev:
+    # lbbrhzn/ocpp integration, charger id "charger" (entity prefix). VERIFY the prefix.
+    connected_entity: sensor.charger_status_connector         # Preparing / Charging / SuspendedEV(SE) = plugged in
+    session_energy_entity: sensor.charger_energy_session      # counts down "EV energy to add"
+    # soc_entity: sensor.my_car_battery                       # if your car's SoC is in HA, use it instead
+    battery_kwh: 60
+    min_kw: 4.1                           # 3 x 6 A
+    max_kw: 11                            # 3 x 16 A
+    phases: 3
+    efficiency: 0.9
+    target_soc_pct: 80
+    ready_by: "07:00"
+    mode: smart
+    start:
+      # Pause/resume with the charging profile so the OCPP session stays open.
+      - action: ocpp.set_charge_rate
+        data:
+          limit_amps: "{{ [current_a | round(0), 6] | max | int }}"
+      - if:
+          - condition: state
+            entity_id: switch.charger_charge_control
+            state: "off"
+        then:
+          - action: switch.turn_on
+            target: {entity_id: switch.charger_charge_control}
+    stop:
+      - action: ocpp.set_charge_rate
+        data:
+          limit_amps: 0
+
+  # ESPHome firmware (select "EMS mode": Idle / Charge / Discharge, number "EMS power" W =
+  # battery-side power, number "EMS target SoC" %). Every 10 s the firmware checks the whole
+  # percent SoC: Charge falls back to Idle once SoC >= target, Discharge once SoC <= target,
+  # whatever the power. Idle hands control back to the inverter's own self-use logic.
+  # Home EMS therefore sends:
+  #   - target_soc rounded in the direction of travel, at least 1 % away from the SoC
+  #     (charge up, discharge down, never below the reserve), so a short or slow block
+  #     does not end before it starts;
+  #   - hold for a 0 W charge/export ("PV to grid") and for self consumption at the
+  #     reserve (the inverter's own self use would keep discharging below it).
+  # The mode sensor shows what was sent in its control_mode and stop_soc attributes.
+  control:
+    enabled: false
+    reapply_minutes: 5                    # resend each update: the firmware drops to Idle at the target
+    charge:
+      - action: number.set_value
+        target: {entity_id: number.deye_30k_ems_power}
+        data: {value: "{{ power_w }}"}
+      - action: number.set_value
+        target: {entity_id: number.deye_30k_ems_target_soc}
+        data: {value: "{{ [target_soc, 100] | min }}"}
+      - action: select.select_option
+        target: {entity_id: select.deye_30k_ems_mode}
+        data: {option: Charge}
+    export:
+      - action: number.set_value
+        target: {entity_id: number.deye_30k_ems_power}
+        data: {value: "{{ power_w }}"}
+      - action: number.set_value
+        target: {entity_id: number.deye_30k_ems_target_soc}
+        data: {value: "{{ [target_soc, reserve_soc] | max }}"}
+      - action: select.select_option
+        target: {entity_id: select.deye_30k_ems_mode}
+        data: {option: Discharge}
+    hold:
+      # The firmware has no hold mode: discharge at 0 W keeps the battery idle
+      # (target 0 % so it never counts as "reached"). PV covers the house first, a
+      # surplus goes to the grid, a shortfall comes from the grid.
+      - action: number.set_value
+        target: {entity_id: number.deye_30k_ems_power}
+        data: {value: 0}
+      - action: number.set_value
+        target: {entity_id: number.deye_30k_ems_target_soc}
+        data: {value: 0}
+      - action: select.select_option
+        target: {entity_id: select.deye_30k_ems_mode}
+        data: {option: Discharge}
+    self_consumption:
+      - action: select.select_option
+        target: {entity_id: select.deye_30k_ems_mode}
+        data: {option: Idle}
+      - action: number.set_value
+        target: {entity_id: number.deye_30k_ems_power}
+        data: {value: 0}
+
+# ----------------------------------------------------------------------------------
+# Alternative: GoodWe GW10K with the GoodWe integration (eco charge / eco discharge).
+# VERIFY all entity ids and option names in Developer tools > States first; the power
+# number is a percentage of the 10 kW rating. Replace battery/grid limits accordingly
+# (max_charge_kw / max_discharge_kw 10).
+#
+#   control:
+#     charge:
+#       - action: number.set_value
+#         target: {entity_id: number.goodwe_eco_mode_power}
+#         data: {value: "{{ (power_w / 100) | round(0) | int }}"}     # % of 10 kW
+#       - action: number.set_value
+#         target: {entity_id: number.goodwe_eco_mode_soc}
+#         data: {value: "{{ target_soc }}"}
+#       - action: select.select_option
+#         target: {entity_id: select.goodwe_inverter_operation_mode}
+#         data: {option: eco_charge}
+#     export:
+#       - action: number.set_value
+#         target: {entity_id: number.goodwe_eco_mode_power}
+#         data: {value: "{{ (power_w / 100) | round(0) | int }}"}
+#       - action: select.select_option
+#         target: {entity_id: select.goodwe_inverter_operation_mode}
+#         data: {option: eco_discharge}
+#     hold:
+#       - action: number.set_value
+#         target: {entity_id: number.goodwe_eco_mode_power}
+#         data: {value: 0}
+#       - action: select.select_option
+#         target: {entity_id: select.goodwe_inverter_operation_mode}
+#         data: {option: eco_discharge}
+#     self_consumption:
+#       - action: select.select_option
+#         target: {entity_id: select.goodwe_inverter_operation_mode}
+#         data: {option: general}

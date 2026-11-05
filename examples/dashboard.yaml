@@ -1,0 +1,254 @@
+# Home EMS dashboard: a complete dashboard configuration (one view).
+#
+# Settings → Dashboards → + Add dashboard → "New dashboard from scratch", name it
+# Home EMS. Open it → ✏️ (edit) → ⋮ → Raw configuration editor, select everything
+# there, paste this whole file over it and save.
+#
+# To add it to an existing dashboard instead, copy only the part from
+# "- title: Home EMS" down and paste it under that dashboard's own `views:`,
+# next to the views already there (same indentation as the other "- title:").
+#
+# * custom:home-ems-plan-card and custom:home-ems-schedule-card ship with the
+#   integration; browsers load them automatically. For the iOS app add both as
+#   dashboard resources (JavaScript module): /home_ems/home-ems-plan-card.js and
+#   /home_ems/home-ems-schedule-card.js.
+# * The week chart needs apexcharts-card (HACS: RomRider/apexcharts-card).
+#   Without it, remove that one card.
+title: Home EMS
+views:
+  - title: Home EMS
+    path: home-ems
+    icon: mdi:home-battery
+    type: sections
+    max_columns: 3
+    sections:
+      # ------------------------------------------------------------------ status
+      - type: grid
+        cards:
+          - type: heading
+            heading: Status
+            icon: mdi:home-battery
+          - type: tile
+            entity: sensor.home_ems_mode
+          - type: tile
+            entity: sensor.home_ems_target_soc
+          - type: tile
+            entity: sensor.home_ems_next_charge
+          - type: tile
+            entity: sensor.home_ems_planned_savings
+          - type: tile
+            entity: sensor.home_ems_battery_savings
+          - type: tile
+            entity: sensor.home_ems_import_price
+          - type: tile
+            entity: sensor.home_ems_export_price
+          - type: tile
+            entity: sensor.home_ems_pv_forecast
+          - type: tile
+            entity: sensor.home_ems_load_forecast
+          - type: tile
+            entity: switch.home_ems_control_inverter
+            name: Control inverter (live)
+            grid_options: {columns: 12}
+          - type: tile
+            entity: button.home_ems_recalculate
+            tap_action: {action: perform-action, perform_action: button.press, target: {entity_id: button.home_ems_recalculate}}
+          - type: tile
+            entity: button.home_ems_refresh_forecasts
+            tap_action: {action: perform-action, perform_action: button.press, target: {entity_id: button.home_ems_refresh_forecasts}}
+
+      # -------------------------------------------------------------------- plan
+      - type: grid
+        column_span: 2
+        cards:
+          - type: heading
+            heading: Plan
+            icon: mdi:chart-timeline-variant
+          - type: custom:home-ems-plan-card
+            entity: sensor.home_ems_plan
+            resolution: 60          # 15, 30, 60 or 120 minutes per row
+            expand: today           # today | all | none (click a day to open it)
+            price_unit: cent        # cent | eur
+          - type: custom:apexcharts-card
+            header:
+              show: true
+              title: Week
+              show_states: false
+            graph_span: 7d
+            span:
+              start: hour
+            now:
+              show: true
+            all_series_config:
+              show:
+                legend_value: false        # the plan sensor's own unit (EUR) is not what these lines show
+            yaxis:
+              - id: soc
+                min: 0
+                max: 100
+                decimals: 0
+                apex_config:
+                  title: {text: "SoC %"}
+              - id: price
+                opposite: true
+                decimals: 2
+                apex_config:
+                  title: {text: "EUR/kWh"}
+              - id: power                  # hidden kW axis, fixed scale so 15 kW is about a third of the height
+                show: false
+                min: 0
+                max: 45
+            series:
+              - entity: sensor.home_ems_plan
+                name: Battery SoC
+                unit: "%"
+                yaxis_id: soc
+                type: area
+                opacity: 0.3
+                stroke_width: 1
+                data_generator: |
+                  return entity.attributes.slots.map(s => [new Date(s.start).getTime(), s.soc]);
+              - entity: sensor.home_ems_plan
+                name: Import price
+                unit: EUR/kWh
+                yaxis_id: price
+                curve: stepline
+                stroke_width: 1
+                data_generator: |
+                  return entity.attributes.slots.map(s => [new Date(s.start).getTime(), s.import_price]);
+              - entity: sensor.home_ems_plan
+                name: Grid charge
+                unit: kW
+                yaxis_id: power
+                type: column
+                color: "#1e88e5"
+                data_generator: |
+                  return entity.attributes.slots.map(s => [new Date(s.start).getTime(), s.mode === 'charge' ? Math.max(s.battery_kwh, 0) * 4 : 0]);
+              - entity: sensor.home_ems_plan
+                name: Battery export
+                unit: kW
+                yaxis_id: power
+                type: column
+                color: "#43a047"
+                data_generator: |
+                  return entity.attributes.slots.map(s => [new Date(s.start).getTime(), s.mode === 'export' ? Math.max(-s.battery_kwh, 0) * 4 : 0]);
+              - entity: sensor.home_ems_plan
+                name: EV
+                unit: kW
+                yaxis_id: power
+                type: column
+                color: "#8e24aa"
+                data_generator: |
+                  return entity.attributes.slots.map(s => [new Date(s.start).getTime(), s.ev_kwh * 4]);
+              - entity: sensor.home_ems_plan
+                name: PV
+                unit: kW
+                yaxis_id: power
+                type: area
+                opacity: 0.2
+                stroke_width: 0
+                color: "#fbc02d"
+                data_generator: |
+                  return entity.attributes.slots.map(s => [new Date(s.start).getTime(), s.pv_kwh * 4]);
+
+      # ----------------------------------------------------------------- battery
+      - type: grid
+        cards:
+          - type: heading
+            heading: Battery
+            icon: mdi:battery-high
+          - type: entities
+            show_header_toggle: false
+            entities:
+              - switch.home_ems_allow_grid_charging
+              - switch.home_ems_allow_battery_export
+              - number.home_ems_trading_aggressiveness
+              - type: divider
+              - number.home_ems_max_charge_power
+              - number.home_ems_max_discharge_power
+              - number.home_ems_reserve_soc
+              - number.home_ems_hold_soc
+              - number.home_ems_hold_strength
+              - number.home_ems_max_soc
+              - number.home_ems_battery_wear_cost
+
+      # ------------------------------------------------------------------ prices
+      - type: grid
+        cards:
+          - type: heading
+            heading: Prices
+            icon: mdi:currency-eur
+          - type: entities
+            show_header_toggle: false
+            entities:
+              - number.home_ems_max_grid_charge_price
+              - number.home_ems_min_battery_export_price
+              - number.home_ems_forecast_price_margin
+              - switch.home_ems_automatic_forecast_trust
+          - type: markdown
+            content: |
+              {% set p = state_attr('sensor.home_ems_import_price', 'sources') or {} %}
+              {% set firm = state_attr('sensor.home_ems_import_price', 'firm_until') %}
+              **Fixed prices until** {{ as_timestamp(firm) | timestamp_custom('%a %d %b %H:%M') if firm else '–' }}
+              {% for f in p.get('forecasts', []) %}
+              * **{{ f.name }}**: until {{ as_timestamp(f.covers_until) | timestamp_custom('%a %d %b %H:%M') if f.covers_until else '–' }},
+                last update {{ as_timestamp(f.last_success) | timestamp_custom('%d %b %H:%M') if f.last_success else 'never' }}{% if f.error %} — ⚠️ {{ f.error }}{% endif %}
+              {% endfor %}
+              {% for name, days in (p.get('skill') or {}).items() %}
+              **Trust {{ name }}** (days ahead: % of the predicted swing kept, ± error ct/kWh, scored hours)
+              {% for d in days[1:7] %}+{{ d.days_ahead }}d: {{ (d.trust * 100) | round(0) | int }}% ±{{ '%.1f' % (d.error * 100) }} ({{ d.samples }}){% if not loop.last %} · {% endif %}{% endfor %}
+              {% endfor %}
+
+      # ---------------------------------------------------------------- forecast
+      - type: grid
+        cards:
+          - type: heading
+            heading: Forecast
+            icon: mdi:weather-partly-cloudy
+          - type: entities
+            show_header_toggle: false
+            entities:
+              - number.home_ems_pv_pessimism
+              - number.home_ems_load_margin
+          - type: markdown
+            content: |
+              | Day | PV | Load | EV | Cost | End SoC |
+              |---|---:|---:|---:|---:|---:|
+              {% for d in state_attr('sensor.home_ems_plan', 'days') or [] -%}
+              | {{ as_timestamp(d.date ~ 'T12:00:00') | timestamp_custom('%a %d %b') }} | {{ '%.1f' % d.pv_kwh }} | {{ '%.1f' % d.load_kwh }} | {{ '%.1f' % d.ev_kwh }} | €{{ '%.2f' % d.cost }} | {{ '%.0f' % d.end_soc }}% |
+              {% endfor %}
+
+      # --------------------------------------------------------------------- EV
+      - type: grid
+        cards:
+          - type: heading
+            heading: EV
+            icon: mdi:car-electric
+          - type: tile
+            entity: sensor.home_ems_ev
+            grid_options: {columns: 12}
+          - type: entities
+            show_header_toggle: false
+            entities:
+              - select.home_ems_ev_charge_mode
+              - time.home_ems_ev_ready_by
+              - number.home_ems_ev_energy_to_add
+              - number.home_ems_ev_target_soc
+              - switch.home_ems_ev_may_use_house_battery
+          - type: markdown
+            content: |
+              {% set ev = states.sensor.home_ems_ev.attributes if states.sensor.home_ems_ev else {} %}
+              {% if ev.connected %}
+              Needed **{{ ev.energy_needed_kwh }} kWh**{% if ev.session_kwh is defined %} (session so far {{ ev.session_kwh }} kWh){% endif %},
+              planned **{{ ev.planned_kwh }} kWh**, ready by {{ as_timestamp(ev.ready_by) | timestamp_custom('%a %H:%M') }}.
+              {% if ev.next_start %}Next start {{ as_timestamp(ev.next_start) | timestamp_custom('%a %H:%M') }}.{% endif %}
+              {% else %}
+              Car not connected.
+              {% endif %}
+
+      # ------------------------------------------------- manual slots and loads
+      - type: grid
+        cards:
+          - type: custom:home-ems-schedule-card
+            # presets:                       # quick fill buttons for heavy loads ([] hides them)
+            #   - {name: Sauna, power_kw: 6, duration_min: 90, icon: mdi:hot-tub}
