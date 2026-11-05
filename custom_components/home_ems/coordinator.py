@@ -14,7 +14,7 @@ from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder.statistics import statistics_during_period
 from homeassistant.const import UnitOfEnergy
 from homeassistant.core import Context, HomeAssistant, callback
-from homeassistant.helpers.event import async_track_time_change
+from homeassistant.helpers.event import async_track_state_change_event, async_track_time_change
 from homeassistant.helpers.script import Script, async_validate_actions_config
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
@@ -399,6 +399,30 @@ class EmsCoordinator(DataUpdateCoordinator[EmsData]):
             _LOGGER.warning("Could not read price history from the recorder: %s", err)
 
     @callback
+    @callback
+    def async_refresh_when_soc_available(self) -> None:
+        """Plan as soon as the SoC sensor reports a number.
+
+        Its integration (a BMS over Bluetooth, MQTT, Modbus...) can come up
+        after Home Assistant has started; don't wait a whole update interval.
+        """
+        entity = self.conf[CONF_BATTERY][CONF_SOC_ENTITY]
+
+        @callback
+        def _changed(event) -> None:
+            new = event.data.get("new_state")
+            try:
+                float(new.state)
+            except (AttributeError, TypeError, ValueError):
+                return
+            unsub()
+            if unsub in self._unsub:
+                self._unsub.remove(unsub)
+            self.hass.async_create_task(self.async_request_refresh())
+
+        unsub = async_track_state_change_event(self.hass, [entity], _changed)
+        self._unsub.append(unsub)
+
     def async_shutdown_listeners(self) -> None:
         for unsub in self._unsub:
             unsub()
@@ -546,6 +570,23 @@ class EmsCoordinator(DataUpdateCoordinator[EmsData]):
         start = row["start"]
         return int(start.timestamp()) if isinstance(start, datetime) else int(start)
 
+    def _load_entity_problem(self) -> str | None:
+        """Why the recorder keeps no usable statistics for the load sensor, if it can tell."""
+        entity = self.conf[CONF_LOAD].get(CONF_ENERGY_ENTITY)
+        if not entity:
+            return "no load.energy_entity configured: the load model only learns from one"
+        state = self.hass.states.get(entity)
+        if state is None:
+            return f"load sensor {entity} does not exist"
+        state_class = state.attributes.get("state_class")
+        if state_class not in ("total", "total_increasing"):
+            return (
+                f"load sensor {entity} has state_class '{state_class or 'none'}': set state_class "
+                "total_increasing (device_class energy, unit kWh) so the recorder keeps the "
+                "long-term statistics the load model reads. History builds up from then on."
+            )
+        return None
+
     async def _sync_load_history(self, days: int) -> None:
         load_conf = self.conf[CONF_LOAD]
         entity = load_conf.get(CONF_ENERGY_ENTITY)
@@ -650,7 +691,15 @@ class EmsCoordinator(DataUpdateCoordinator[EmsData]):
             if self._last_soc_kwh is not None:
                 warnings.append("battery SoC unavailable, using last known value")
                 return self._last_soc_kwh
-            raise UpdateFailed(f"battery SoC entity {bat[CONF_SOC_ENTITY]} is unavailable")
+            if state is None:
+                raise UpdateFailed(
+                    f"battery SoC entity {bat[CONF_SOC_ENTITY]} does not exist: check the entity id "
+                    "(Settings > Devices & services > Entities)"
+                ) from None
+            raise UpdateFailed(
+                f"battery SoC entity {bat[CONF_SOC_ENTITY]} is '{state.state}'; "
+                "planning starts as soon as it reports a number"
+            ) from None
         soc = value * bat[CONF_CAPACITY] / 100 if bat[CONF_SOC_UNIT] == "percent" else value
         self._last_soc_kwh = soc
         return soc
@@ -869,6 +918,8 @@ class EmsCoordinator(DataUpdateCoordinator[EmsData]):
         house = forecaster.forecast(slot_starts, now) * (1 + float(self.settings[SET_LOAD_MARGIN_PCT]) / 100)
         if forecaster.history_days < 7:
             warnings.append(f"load model has {forecaster.history_days} days of history (default profile used)")
+            if problem := self._load_entity_problem():
+                warnings.append(problem)
 
         self.heavy_loads = [h for h in self.heavy_loads if not h.expired(now)]
         self.manual_slots = [s for s in self.manual_slots if not s.expired(now)]

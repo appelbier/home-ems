@@ -589,3 +589,40 @@ async def test_control_commands_suit_the_deye_firmware(recorder_mock, enable_cus
     assert current("self_consumption", 0.4, 0.0, load=0.1, pv=1.0)["control_mode"] == "self_consumption"
     charge = current("charge", 0.25, 1.0)
     assert charge["control_mode"] == "charge" and charge["stop_soc"] == 51
+
+
+async def test_load_sensor_without_statistics_is_explained(recorder_mock, enable_custom_integrations, hass: HomeAssistant) -> None:
+    """A template sensor without state_class has no long-term statistics: say so."""
+    now = dt_util.now()
+    hass.states.async_set("sensor.battery_soc", "50")
+    hass.states.async_set("sensor.day_ahead", "0.10", _price_attrs(now))
+    hass.states.async_set("sensor.solcast_today", "10", _solcast_attrs(now))
+    hass.states.async_set("sensor.load_today", "12.3", {"unit_of_measurement": "kWh", "device_class": "energy"})
+    conf = _config()
+    conf[DOMAIN]["load"] = {"energy_entity": "sensor.load_today"}
+    assert await async_setup_component(hass, DOMAIN, conf)
+    await hass.async_block_till_done()
+    coordinator = hass.data[DOMAIN]
+    await coordinator.async_refresh()
+    warnings = hass.states.get("sensor.home_ems_mode").attributes["warnings"]
+    assert any("state_class 'none'" in w for w in warnings), warnings
+
+
+async def test_plans_as_soon_as_a_late_soc_sensor_reports(recorder_mock, enable_custom_integrations, hass: HomeAssistant) -> None:
+    """A BMS integration that comes up after HA has started must not leave the planner waiting."""
+    now = dt_util.now()
+    hass.states.async_set("sensor.battery_soc", "unavailable")
+    hass.states.async_set("sensor.day_ahead", "0.10", _price_attrs(now))
+    hass.states.async_set("sensor.solcast_today", "10", _solcast_attrs(now))
+    assert await async_setup_component(hass, DOMAIN, _config())
+    await hass.async_block_till_done()
+    await hass.async_start()
+    await hass.async_block_till_done()
+    coordinator = hass.data[DOMAIN]
+    assert not coordinator.last_update_success
+    assert "is 'unavailable'" in str(coordinator.last_exception)
+
+    hass.states.async_set("sensor.battery_soc", "62")
+    await hass.async_block_till_done()
+    assert coordinator.last_update_success, coordinator.last_exception
+    assert hass.states.get("sensor.home_ems_mode").attributes["soc"] == 62.0

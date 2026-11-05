@@ -102,6 +102,8 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         # Price, Solcast and SoC entities from other integrations exist by now.
         await coordinator.async_bootstrap_history()
         await coordinator.async_refresh()
+        if not coordinator.last_update_success:
+            coordinator.async_refresh_when_soc_available()
 
     async_at_started(hass, _started)
 

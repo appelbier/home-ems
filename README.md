@@ -226,6 +226,24 @@ charger's energy sensor (and other separately planned loads) under
 `subtract_entities`. Until 7 days of history exist, a typical profile scaled to
 `default_daily_kwh` is used.
 
+A sensor that resets every day (e.g. "load today") is fine, as long as it has
+`state_class: total_increasing`. A template sensor needs it set explicitly:
+
+```yaml
+template:
+  - sensor:
+      - name: load_today_template
+        unit_of_measurement: kWh
+        device_class: energy
+        state_class: total_increasing
+        state: "{{ ... }}"
+```
+
+Without it the recorder keeps only state history, no long-term statistics, and
+the load model stays empty (a warning names the cause). Statistics start when
+the state class is added; earlier days are not filled in afterwards. Check
+Developer tools → Statistics: the sensor must be listed without issues.
+
 ### EV
 
 * `connected_entity`: any sensor or binary sensor. "Connected" matches
