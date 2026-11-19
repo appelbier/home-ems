@@ -45,6 +45,7 @@ from .const import (
     CONF_EV_STOP,
     CONF_EV_TARGET_SOC,
     CONF_EV_VOLTAGE,
+    CONF_EXPORT_BONUS_PCT,
     CONF_EXPORT_FEE,
     CONF_EXPORT_LIMIT,
     CONF_EXPORT_MODE,
@@ -52,6 +53,8 @@ from .const import (
     CONF_FORECASTS,
     CONF_FORECAST_MARGIN,
     CONF_GRID,
+    CONF_GRID_EXPORT_ENTITY,
+    CONF_GRID_IMPORT_ENTITY,
     CONF_HEADERS,
     CONF_HEAVY_LOADS,
     CONF_HISTORY_DAYS,
@@ -60,6 +63,7 @@ from .const import (
     CONF_HOLD_COST,
     CONF_HOLD_PCT,
     CONF_MAX_LOAD_KW,
+    CONF_METERING,
     CONF_NET_METERING_UNTIL,
     CONF_IMPORT_LIMIT,
     CONF_IMPORT_MARKUP,
@@ -74,8 +78,10 @@ from .const import (
     CONF_MODE,
     CONF_NAME,
     CONF_PLAN_DAYS,
+    CONF_POWER_ENTITY,
     CONF_POWER_KW,
     CONF_PRICES,
+    CONF_PV_ENERGY_ENTITY,
     CONF_PV_SCALE,
     CONF_REAPPLY_MINUTES,
     CONF_REFRESH_MINUTES,
@@ -94,6 +100,7 @@ from .const import (
     CONF_START,
     CONF_START_TIME,
     CONF_SUBTRACT_ENTITIES,
+    CONF_SUBTRACT_POWER_ENTITIES,
     CONF_TERMINAL_VALUE,
     CONF_TIME_KEY,
     CONF_UNIT,
@@ -204,6 +211,8 @@ PRICES_SCHEMA = vol.Schema(
         vol.Optional(CONF_EXPORT_MODE, default=EXPORT_RAW): vol.In([EXPORT_RAW, EXPORT_SAME_AS_IMPORT]),
         vol.Optional(CONF_EXPORT_FEE, default=0.0): vol.Coerce(float),
         vol.Optional(CONF_EXPORT_VAT, default=False): cv.boolean,
+        # Supplier bonus on the market price of exported energy, e.g. Zonneplan 10.
+        vol.Optional(CONF_EXPORT_BONUS_PCT, default=0.0): vol.All(vol.Coerce(float), vol.Range(0, 100)),
         vol.Optional(CONF_FORECAST_MARGIN, default=0.01): vol.Coerce(float),
         vol.Optional(CONF_HISTORY_WEEKS, default=4): vol.All(int, vol.Range(1, 8)),
         vol.Optional(CONF_HISTORY_SOURCE): SOURCE_SCHEMA,
@@ -218,6 +227,9 @@ SOLAR_SCHEMA = vol.Schema(
         vol.Optional(CONF_SOLCAST_CALLS, default=8): vol.All(int, vol.Range(1, 50)),
         vol.Optional(CONF_SOLCAST_ENTITIES, default=[]): cv.entity_ids,
         vol.Optional(CONF_PV_SCALE, default=1.0): vol.Coerce(float),
+        # Metered PV yield (kWh, total_increasing) for the automatic calibration;
+        # defaults to metering.pv_energy_entity.
+        vol.Optional(CONF_ENERGY_ENTITY): cv.entity_id,
     }
 )
 
@@ -225,6 +237,9 @@ LOAD_SCHEMA = vol.Schema(
     {
         vol.Optional(CONF_ENERGY_ENTITY): cv.entity_id,
         vol.Optional(CONF_SUBTRACT_ENTITIES, default=[]): cv.entity_ids,
+        # Current house power (W or kW): corrects the plan for the next hour.
+        vol.Optional(CONF_POWER_ENTITY): cv.entity_id,
+        vol.Optional(CONF_SUBTRACT_POWER_ENTITIES, default=[]): cv.entity_ids,
         vol.Optional(CONF_HISTORY_DAYS, default=28): vol.All(int, vol.Range(7, 90)),
         vol.Optional(CONF_DEFAULT_DAILY_KWH, default=15.0): vol.Coerce(float),
         # Highest believable house load; readings above it are meter glitches.
@@ -278,6 +293,16 @@ MANUAL_SLOT_SCHEMA = vol.Schema(
     }
 )
 
+# Cumulative kWh sensors with long-term statistics; together with
+# load.energy_entity they give the realised cost and savings per day.
+METERING_SCHEMA = vol.Schema(
+    {
+        vol.Required(CONF_GRID_IMPORT_ENTITY): cv.entity_id,
+        vol.Required(CONF_GRID_EXPORT_ENTITY): cv.entity_id,
+        vol.Required(CONF_PV_ENERGY_ENTITY): cv.entity_id,
+    }
+)
+
 HEAVY_LOAD_SCHEMA = vol.Schema(
     {
         vol.Required(CONF_NAME): cv.string,
@@ -302,6 +327,7 @@ CONFIG_SCHEMA = vol.Schema(
                 vol.Required(CONF_PRICES): PRICES_SCHEMA,
                 vol.Optional(CONF_SOLAR, default={}): SOLAR_SCHEMA,
                 vol.Optional(CONF_LOAD, default={}): LOAD_SCHEMA,
+                vol.Optional(CONF_METERING): METERING_SCHEMA,
                 vol.Optional(CONF_EV): EV_SCHEMA,
                 vol.Optional(CONF_CONTROL, default={}): CONTROL_SCHEMA,
                 vol.Optional(CONF_MANUAL_SLOTS, default=[]): vol.All(cv.ensure_list, [MANUAL_SLOT_SCHEMA]),

@@ -33,6 +33,7 @@ class Tariff:
     export_mode: str = EXPORT_RAW
     export_fee: float = 0.0  # subtracted from raw price for export, excl. VAT
     export_vat: bool = False
+    export_bonus: float = 0.0  # share of the market price added to export (e.g. Zonneplan's 10 %)
 
     def import_price(self, raw: np.ndarray) -> np.ndarray:
         return (raw + self.import_markup + self.energy_tax) * (1 + self.vat)
@@ -42,6 +43,19 @@ class Tariff:
             return self.import_price(raw)
         price = raw - self.export_fee
         return price * (1 + self.vat) if self.export_vat else price
+
+    def export_value(self, raw: np.ndarray | float, netted: np.ndarray | bool = False) -> np.ndarray:
+        """What one exported kWh earns.
+
+        While net metering (salderen) applies that is the import price, after it
+        ``export_price``. Both get the supplier's bonus on a positive market
+        price, with VAT where the export price carries VAT.
+        """
+        raw = np.asarray(raw, dtype=float)
+        base = np.where(netted, self.import_price(raw), self.export_price(raw))
+        with_vat = self.export_vat or self.export_mode == EXPORT_SAME_AS_IMPORT
+        vat = np.where(np.logical_or(netted, with_vat), 1 + self.vat, 1.0)
+        return base + self.export_bonus * np.maximum(raw, 0.0) * vat
 
     def to_raw(self, all_in: np.ndarray | float) -> np.ndarray | float:
         """Invert ``import_price`` for sources that publish all-in prices."""

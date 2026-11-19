@@ -82,6 +82,10 @@ is installed automatically.
   (`raw` after net metering ends, or `import` while *salderen* still applies),
   `export_fee`, `export_vat`. Check the current energy tax: the default
   (0.0916 €/kWh excl. VAT) is a placeholder.
+* `export_bonus_pct`: a supplier bonus on the market price of exported energy
+  (Zonneplan's "Zonnebonus" is 10). It is added to positive prices, with VAT
+  while salderen applies, in both the plan and the realised savings. A fixed
+  extra per exported kWh after salderen is a negative `export_fee`.
 * `net_metering_until: "2027-01-01"`: until that date export earns the import
   price (salderen), after it `export_mode` applies. Plans that span New Year's
   Day get the right export value on both sides.
@@ -169,6 +173,27 @@ personal limits.
   The last forecast is stored, so restarts don't use extra calls.
 * `number.home_ems_pv_pessimism`: 0 = P50, 1 = P10 (default 0.3).
 
+#### PV calibration (automatic)
+
+Solcast can be consistently off for a roof: a wrong kWp or tilt in its site
+settings, a tree shading the morning, an inverter that clips at noon. Home EMS
+logs the P50 it used for every quarter hour and compares it with the metered
+yield (`metering.pv_energy_entity`, or `solar.energy_entity`; kWh,
+total_increasing) of the last 21 days:
+
+* **overall factor**: the forecast-weighted median of the daily ratios. Days
+  with a ratio below 0.3 or above 3 (snow, an outage) are left out, and with
+  few days the factor is shrunk towards 1;
+* **per hour of the day**: the ratio per hour (morning shade, evening sun),
+  leaning on the overall factor where an hour has little energy.
+
+From 3 valid days on, the forecast (after `pv_pessimism`) is multiplied by
+the factor of its hour, within 0.5–1.5. Slots at negative prices are skipped
+when the inverter may curtail. `switch.home_ems_automatic_pv_calibration` (on
+by default) turns it off; it keeps learning meanwhile. The factors are in
+`sensor.home_ems_pv_forecast` → `calibration`. With it on, leave
+`solar.pv_scale` at 1.
+
 ### Battery power limits
 
 * `max_charge_kw`: grid charging setpoint.
@@ -226,6 +251,17 @@ charger's energy sensor (and other separately planned loads) under
 `subtract_entities`. Until 7 days of history exist, a typical profile scaled to
 `default_daily_kwh` is used.
 
+`load.power_entity` (optional, W or kW) is the house's current power. Its
+5-minute average replaces the forecast for the current quarter hour and fades
+back to the forecast over about an hour (weight 1 now, ~0.26 after an hour,
+~0.07 after two). So when the oven or a heat pump runs while the plan holds the
+battery, the next re-plan (within 5 minutes) sees it and switches to self
+consumption if that is cheaper; while grid charging it leaves room on the
+connection. List the EV charger's power under `subtract_power_entities` (the
+EV is planned separately). Heavy loads planned for now are already part of the
+reading; those planned later stay as planned. `sensor.home_ems_load_forecast`
+shows the value used as `live_kw`.
+
 A sensor that resets every day (e.g. "load today") is fine, as long as it has
 `state_class: total_increasing`. A template sensor needs it set explicitly:
 
@@ -243,6 +279,42 @@ Without it the recorder keeps only state history, no long-term statistics, and
 the load model stays empty (a warning names the cause). Statistics start when
 the state class is added; earlier days are not filled in afterwards. Check
 Developer tools → Statistics: the sensor must be listed without issues.
+
+### Realised savings
+
+The plan's cost and savings are forecasts for the coming week: they move with
+every re-plan and say little about what you actually saved. With a `metering:`
+block Home EMS also looks back:
+
+```yaml
+metering:
+  grid_import_entity: sensor.grid_import_energy   # kWh, total_increasing
+  grid_export_entity: sensor.grid_export_energy
+  pv_energy_entity: sensor.pv_energy
+```
+
+Every hour it reads the recorder statistics of these meters and of
+`load.energy_entity` (which must measure all consumption, incl. the EV) and,
+for every past 15 minutes:
+
+* **paid** = import × import price − export × export price (the real cost);
+* **without battery** = the same load minus PV straight from or to the grid,
+  at the same prices, capped at the export limit;
+* **saved** = without battery − paid.
+
+Prices are the day-ahead prices of that slot with your tariff (and salderen
+while it applies). A quarter hour with an impossible reading (above twice the
+grid limits or `load.max_kw`, or negative, as when an energy counter resets and
+the recorder books its whole total at once) is left out and counted in
+`rejected_slots`. The savings include the battery's and inverter's losses; the
+wear estimate (`cycle_cost` × energy through the battery) is reported
+separately. At startup it fills in as many past days as the recorder has
+(28 days of hourly statistics by default). Days are kept permanently, so the
+total keeps growing. A single day can look odd when the battery is charged
+today and used tomorrow; over weeks that evens out.
+
+`sensor.home_ems_realised_savings` holds the running total; the plan card shows
+it as "Realised" and the example dashboard has a table for today, 7 and 30 days.
 
 ### EV
 
@@ -301,6 +373,7 @@ Actions run again when the mode or power changes, and every
 | `sensor.home_ems_target_soc`, `sensor.home_ems_next_charge` | Current target / next grid-charge block |
 | `sensor.home_ems_planned_savings` | Plan versus plain self consumption with the same battery, over the horizon |
 | `sensor.home_ems_battery_savings` | Plan versus no battery at all, over the horizon |
+| `sensor.home_ems_realised_savings` | What the battery really saved so far (needs `metering:`); attributes `today`, `last_7_days`, `last_30_days`, `total`, `days` |
 | `sensor.home_ems_import_price`, `…_export_price` | Current consumer prices with forecast |
 | `sensor.home_ems_pv_forecast`, `…_load_forecast` | Remaining today, plus per-day totals |
 | `sensor.home_ems_heavy_loads`, `…_manual_slots` | Items, incl. chosen starts of flexible loads |
@@ -308,6 +381,7 @@ Actions run again when the mode or power changes, and every
 | `switch.home_ems_control_inverter` | Plan-only vs. active control |
 | `switch.home_ems_allow_grid_charging`, `…_allow_battery_export`, `…_ev_may_use_house_battery` | Policy switches |
 | `switch.home_ems_automatic_forecast_trust` | Damp forecast prices and set their margin from measured accuracy |
+| `switch.home_ems_automatic_pv_calibration` | Correct the PV forecast for a consistent bias measured against the PV meter |
 | `number.home_ems_*` | Max charge/discharge power, reserve/hold/max SoC, hold strength, trading aggressiveness, max grid-charge price, min export price, wear cost, PV pessimism, load margin, forecast margin, EV target / energy |
 | `select.home_ems_ev_charge_mode`, `time.home_ems_ev_ready_by` | EV settings |
 | `button.home_ems_recalculate`, `…_refresh_forecasts` | Manual triggers |

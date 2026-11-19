@@ -109,6 +109,9 @@ async def test_full_cycle(recorder_mock, enable_custom_integrations, hass: HomeA
     assert hass.states.get("number.home_ems_hold_soc").state == hass.states.get("number.home_ems_reserve_soc").state
     assert hass.states.get("number.home_ems_hold_strength").state == "0.1"
     assert hass.states.get("number.home_ems_trading_aggressiveness").state == "100.0"
+    assert hass.states.get("switch.home_ems_automatic_pv_calibration").state == "on"
+    calibration = hass.states.get("sensor.home_ems_pv_forecast").attributes["calibration"]
+    assert calibration["enabled"] and calibration["factor"] == 1.0  # nothing metered yet
     savings = hass.states.get("sensor.home_ems_battery_savings")
     assert savings is not None and float(savings.state) == plan.attributes["battery_savings"]
     assert {"savings", "no_battery_cost", "wear_cost", "stored_value_change"} <= set(plan.attributes)
@@ -626,3 +629,64 @@ async def test_plans_as_soon_as_a_late_soc_sensor_reports(recorder_mock, enable_
     await hass.async_block_till_done()
     assert coordinator.last_update_success, coordinator.last_exception
     assert hass.states.get("sensor.home_ems_mode").attributes["soc"] == 62.0
+
+
+async def test_realised_savings_from_metered_energy(recorder_mock, enable_custom_integrations, hass: HomeAssistant) -> None:
+    """Metered import/export/load/PV are priced per slot into a running total."""
+    await hass.config.async_set_time_zone("Europe/Amsterdam")
+    hass.states.async_set("sensor.battery_soc", "50")
+    hass.states.async_set("sensor.day_ahead", "0.10", _price_attrs(dt_util.now()))
+    conf = {DOMAIN: {"plan_days": 2, "battery": {"capacity_kwh": 144, "soc_entity": "sensor.battery_soc"},
+                     "prices": {"source": {"entity": "sensor.day_ahead"}},
+                     "load": {"energy_entity": "sensor.load_total"},
+                     "metering": {"grid_import_entity": "sensor.grid_in", "grid_export_entity": "sensor.grid_out",
+                                  "pv_energy_entity": "sensor.pv_total"}}}
+    assert await async_setup_component(hass, DOMAIN, conf)
+    await hass.async_block_till_done()
+    coordinator = hass.data[DOMAIN]
+    await coordinator.async_refresh()  # stores today's day-ahead prices in the price history
+
+    hour0 = int(dt_util.start_of_local_day().timestamp())
+    hours = [hour0 + h * 3600 for h in range(int((dt_util.utcnow().timestamp() - hour0) // 3600))]
+    if not hours:  # just after midnight: nothing metered yet today
+        return
+    # The battery covers the house (1 kWh/h) every hour: no import, nothing exported.
+    rows = {
+        "sensor.load_total": [{"start": float(t), "change": 1.0} for t in hours],
+        "sensor.grid_in": [{"start": float(t), "change": 0.0} for t in hours],
+        "sensor.grid_out": [{"start": float(t), "change": 0.0} for t in hours],
+        "sensor.pv_total": [{"start": float(t), "change": 0.0} for t in hours],
+    }
+
+    async def fake_statistics(start, end, ids, period, units, types):
+        return {i: rows[i] for i in ids if i in rows} if period == "hour" else {}
+
+    coordinator._statistics = fake_statistics  # noqa: SLF001
+    await coordinator._sync_metering(2)  # noqa: SLF001
+    await coordinator.async_refresh()
+    state = hass.states.get("sensor.home_ems_realised_savings")
+    assert state is not None and float(state.state) > 0
+    today = state.attributes["today"]
+    assert today["actual_cost"] == 0.0 and today["no_battery_cost"] == float(state.state)
+    assert hass.states.get("sensor.home_ems_plan").attributes["realised_savings"] == float(state.state)
+
+
+async def test_live_house_power_corrects_the_next_hour(recorder_mock, enable_custom_integrations, hass: HomeAssistant) -> None:
+    """A heavy load running now (minus the EV) replaces the forecast for the current slot."""
+    now = dt_util.now()
+    hass.states.async_set("sensor.battery_soc", "50")
+    hass.states.async_set("sensor.day_ahead", "0.10", _price_attrs(now))
+    hass.states.async_set("sensor.house_power", "9000", {"unit_of_measurement": "W"})
+    hass.states.async_set("sensor.ev_power", "3.0", {"unit_of_measurement": "kW"})
+    conf = {DOMAIN: {"plan_days": 2, "battery": {"capacity_kwh": 144, "soc_entity": "sensor.battery_soc"},
+                     "prices": {"source": {"entity": "sensor.day_ahead"}},
+                     "load": {"power_entity": "sensor.house_power", "subtract_power_entities": ["sensor.ev_power"]}}}
+    assert await async_setup_component(hass, DOMAIN, conf)
+    await hass.async_block_till_done()
+    coordinator = hass.data[DOMAIN]
+    await coordinator.async_refresh()
+    assert coordinator.last_update_success, coordinator.last_exception
+    assert hass.states.get("sensor.home_ems_load_forecast").attributes["live_kw"] == 6.0
+    slots = hass.states.get("sensor.home_ems_plan").attributes["slots"]
+    assert slots[1]["load_kwh"] > 1.0  # 6 kW live vs ~0.15 kWh per slot from the default profile
+    assert slots[12]["load_kwh"] < 0.5  # three hours later the forecast is back

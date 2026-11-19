@@ -74,7 +74,8 @@ home_ems:
     # that the raw day-ahead price minus export_fee.
     net_metering_until: "2027-01-01"
     export_mode: raw
-    export_fee: 0.0                       # VERIFY: Zonneplan feed-in fee from 2027
+    export_fee: -0.02                     # Zonneplan pays EUR 0.02/kWh "inkoopvergoeding" on export (counts from 2027)
+    export_bonus_pct: 10                  # Zonneplan "Zonnebonus": +10 % of the market price on export
     forecast_margin: 0.01
 
   solar:
@@ -86,6 +87,7 @@ home_ems:
       - sensor.solcast_pv_forecast_forecast_day_5
       - sensor.solcast_pv_forecast_forecast_day_6
       - sensor.solcast_pv_forecast_forecast_day_7
+    # The automatic PV calibration compares Solcast with metering.pv_energy_entity below.
 
   load:
     # ESPHome "Total load consumption" (kWh, total_increasing, 0.1 kWh resolution).
@@ -94,8 +96,19 @@ home_ems:
     # If the Webasto is on a circuit the Deye load measurement includes, subtract it:
     subtract_entities:
       - sensor.charger_energy_active_import_register         # VERIFY: OCPP charger id "charger"
+    # Current house power: a heavy load running now corrects the next hour of the plan.
+    power_entity: sensor.deye_30k_load_consumption_power     # ESPHome "Load consumption power" (W)
+    subtract_power_entities:
+      - sensor.charger_power_active_import                   # VERIFY: OCPP charging power
     history_days: 28
     default_daily_kwh: 15
+
+  # Realised savings: the metered energy of every past 15 minutes, priced and compared
+  # with the same load and PV without a battery. ESPHome energy counters (kWh, total_increasing).
+  metering:
+    grid_import_entity: sensor.deye_30k_total_energy_import     # VERIFY
+    grid_export_entity: sensor.deye_30k_total_energy_export     # VERIFY
+    pv_energy_entity: sensor.deye_30k_total_production          # VERIFY
 
   ev:
     # lbbrhzn/ocpp integration, charger id "charger" (entity prefix). VERIFY the prefix.

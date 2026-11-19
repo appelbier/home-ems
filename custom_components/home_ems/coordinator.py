@@ -52,8 +52,11 @@ from .const import (
     CONF_EV_STOP,
     CONF_EV_TARGET_SOC,
     CONF_EV_VOLTAGE,
+    CONF_EXPORT_BONUS_PCT,
     CONF_EXPORT_FEE,
     CONF_EXPORT_LIMIT,
+    CONF_GRID_EXPORT_ENTITY,
+    CONF_GRID_IMPORT_ENTITY,
     CONF_EXPORT_MODE,
     CONF_EXPORT_VAT,
     CONF_FORECAST_MARGIN,
@@ -78,7 +81,10 @@ from .const import (
     CONF_MAX_SOC_PCT,
     CONF_MODE,
     CONF_NAME,
+    CONF_METERING,
     CONF_PLAN_DAYS,
+    CONF_POWER_ENTITY,
+    CONF_PV_ENERGY_ENTITY,
     CONF_POWER_KW,
     CONF_PRICES,
     CONF_PV_SCALE,
@@ -92,6 +98,7 @@ from .const import (
     CONF_START,
     CONF_START_TIME,
     CONF_SUBTRACT_ENTITIES,
+    CONF_SUBTRACT_POWER_ENTITIES,
     CONF_TERMINAL_VALUE,
     CONF_UPDATE_INTERVAL,
     CONF_VAT_PCT,
@@ -117,6 +124,7 @@ from .const import (
     SET_MAX_DISCHARGE_KW,
     SET_MAX_SOC_PCT,
     SET_MIN_EXPORT_PRICE,
+    SET_PV_CALIBRATION,
     SET_PV_PESSIMISM,
     SET_RESERVE_PCT,
     STORAGE_KEY,
@@ -140,6 +148,9 @@ from .optimizer import (
     trade_hurdle,
 )
 from .forecast_skill import ForecastSkill
+from .ledger import day_ledger, merge, summary
+from .live import LiveAverage, blend_live, to_kw
+from .pv_calibration import DAYS as PV_CALIBRATION_DAYS, calibrate, slot_factors
 from .price_forecast import Tariff, fit_calibration, forecast_from_history, terminal_value
 from .sources import PriceSource, SolarSource
 from .timeseries import (
@@ -160,6 +171,8 @@ LOAD_SYNC_INTERVAL = timedelta(hours=1)
 FLAT_FORECAST_STD = 0.002  # EUR/kWh; real day profiles vary far more than this
 FLEX_LOCK = timedelta(hours=1)  # a flexible load's start is fixed this long before it
 IDLE_POWER_KW = 0.1  # charge/export setpoints below this are sent as hold
+LEDGER_VERSION = 3  # bump to rebuild stored realised savings from the statistics
+LEDGER_BOOTSTRAP_DAYS = 35  # as far back as the stored prices go (history_weeks + 1)
 
 
 @dataclass
@@ -178,6 +191,7 @@ class EmsData:
     heavy_loads: list[dict[str, Any]]
     manual_slots: list[dict[str, Any]]
     warnings: list[str] = field(default_factory=list)
+    realised: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -277,6 +291,7 @@ class EmsCoordinator(DataUpdateCoordinator[EmsData]):
             export_mode=prices[CONF_EXPORT_MODE],
             export_fee=prices[CONF_EXPORT_FEE],
             export_vat=prices[CONF_EXPORT_VAT],
+            export_bonus=prices[CONF_EXPORT_BONUS_PCT] / 100,
         )
         self.price_source = PriceSource(hass, prices[CONF_SOURCE], self.tariff, self.tz)
         self.forecast_sources = [PriceSource(hass, c, self.tariff, self.tz) for c in prices[CONF_FORECASTS]]
@@ -304,6 +319,12 @@ class EmsCoordinator(DataUpdateCoordinator[EmsData]):
         self.rejected_load: dict[int, float] = {}  # slot -> implausible kWh reading
         self.load_excluded: list[tuple[int, int]] = []  # [start, end) UTC timestamps kept out of the history
         self._history_days = 0
+        self.ledger: dict[str, dict] = {}  # local date -> realised cost and savings
+        self.live_load = LiveAverage()
+        self.pv_forecast_log: dict[int, float] = {}  # slot -> P50 kWh used for it
+        self.pv_actual: dict[int, float] = {}  # slot -> metered PV kWh
+        self.pv_calibration: dict[str, Any] = {"factor": 1.0, "hours": [1.0] * 24, "days": 0}
+        self._live_kw: float | None = None
         self._unsub: list = []
 
     # ------------------------------------------------------------------ setup
@@ -330,6 +351,7 @@ class EmsCoordinator(DataUpdateCoordinator[EmsData]):
             SET_LOAD_MARGIN_PCT: 5.0,
             SET_FORECAST_MARGIN: self.conf[CONF_PRICES][CONF_FORECAST_MARGIN],
             SET_FORECAST_TRUST: True,
+            SET_PV_CALIBRATION: True,
             SET_EV_MODE: ev.get(CONF_EV_MODE, EV_SMART),
             SET_EV_TARGET_SOC: ev.get(CONF_EV_TARGET_SOC, 80.0),
             SET_EV_ENERGY_KWH: 0.0,
@@ -354,6 +376,10 @@ class EmsCoordinator(DataUpdateCoordinator[EmsData]):
                 del self.load_history[ts]
                 self.rejected_load[ts] = value
         self.price_history = {int(k): float(v) for k, v in (stored.get("price_history") or {}).items()}
+        # Ledgers stored before meter glitches were filtered are rebuilt from the statistics.
+        if stored.get("ledger_version") == LEDGER_VERSION:
+            self.ledger = dict(stored.get("ledger") or {})
+        self.pv_forecast_log = {int(k): float(v) for k, v in (stored.get("pv_forecast_log") or {}).items()}
         self.price_skill = ForecastSkill.from_dict(stored.get("forecast_skill"))
         self.solar.restore(stored.get("solar_cache"))
         for source in self.forecast_sources:
@@ -386,6 +412,30 @@ class EmsCoordinator(DataUpdateCoordinator[EmsData]):
         self._unsub.append(
             async_track_time_change(self.hass, self._on_slot_boundary, minute=[0, 15, 30, 45], second=5)
         )
+        load_conf = self.conf[CONF_LOAD]
+        if power := load_conf.get(CONF_POWER_ENTITY):
+            ids = [power, *load_conf[CONF_SUBTRACT_POWER_ENTITIES]]
+            self._unsub.append(async_track_state_change_event(self.hass, ids, self._on_live_power))
+
+    def _live_power_now(self) -> float | None:
+        """House power in kW right now, minus separately planned loads (the EV)."""
+        load_conf = self.conf[CONF_LOAD]
+        total = 0.0
+        for k, entity in enumerate([load_conf[CONF_POWER_ENTITY], *load_conf[CONF_SUBTRACT_POWER_ENTITIES]]):
+            state = self.hass.states.get(entity)
+            try:
+                value = to_kw(float(state.state), state.attributes.get("unit_of_measurement"))  # type: ignore[union-attr]
+            except (AttributeError, TypeError, ValueError):
+                if k == 0:
+                    return None
+                continue  # a missing EV reading counts as 0
+            total += value if k == 0 else -value
+        return max(total, 0.0)
+
+    @callback
+    def _on_live_power(self, _event) -> None:
+        if (value := self._live_power_now()) is not None:
+            self.live_load.add(dt_util.utcnow().timestamp(), value)
 
     async def async_bootstrap_history(self) -> None:
         """Load history from the recorder (run once HA has started)."""
@@ -397,6 +447,14 @@ class EmsCoordinator(DataUpdateCoordinator[EmsData]):
             await self._bootstrap_price_history()
         except Exception as err:  # noqa: BLE001
             _LOGGER.warning("Could not read price history from the recorder: %s", err)
+        try:
+            await self._sync_metering(LEDGER_BOOTSTRAP_DAYS)
+        except Exception as err:  # noqa: BLE001 - only the realised savings are missing
+            _LOGGER.warning("Could not read metered energy from the recorder: %s", err)
+        try:
+            await self._sync_pv_actual(PV_CALIBRATION_DAYS + 1)
+        except Exception as err:  # noqa: BLE001 - the forecast is used uncalibrated
+            _LOGGER.warning("Could not read the PV yield from the recorder: %s", err)
 
     @callback
     @callback
@@ -485,6 +543,9 @@ class EmsCoordinator(DataUpdateCoordinator[EmsData]):
             "load_excluded": [list(r) for r in self.load_excluded],
             "forecast_cache": {s.name: s.cache() for s in self.forecast_sources},
             "forecast_skill": self.price_skill.to_dict(),
+            "ledger": self.ledger,
+            "ledger_version": LEDGER_VERSION,
+            "pv_forecast_log": {str(k): round(v, 4) for k, v in self.pv_forecast_log.items()},
         }
 
     def schedule_save(self) -> None:
@@ -593,8 +654,101 @@ class EmsCoordinator(DataUpdateCoordinator[EmsData]):
         if not entity:
             return
         now = dt_util.utcnow()
+        subtract = load_conf[CONF_SUBTRACT_ENTITIES]
+        energy = await self._slot_energy({entity, *subtract}, days, now)
+        for ts, main in energy.get(entity, {}).items():
+            if self._load_excluded(ts):
+                continue
+            for sub in subtract:
+                main -= energy.get(sub, {}).get(ts, 0.0)
+            main = max(0.0, main)
+            if plausible_load(main, self._max_load_slot_kwh):
+                self.load_history[ts] = main
+            else:
+                self.load_history.pop(ts, None)
+                self.rejected_load[ts] = main
+
+        cutoff = now.timestamp() - (load_conf[CONF_HISTORY_DAYS] + 1) * 86400
+        self.load_history = {k: v for k, v in self.load_history.items() if k >= cutoff}
+        self.rejected_load = {k: v for k, v in self.rejected_load.items() if k >= cutoff}
+        self.load_excluded = [(a, b) for a, b in self.load_excluded if b >= cutoff]
+        self._last_load_sync = now
+        self.schedule_save()
+
+    async def _sync_metering(self, days: int) -> None:
+        """Price the metered energy of the last ``days`` days into the ledger."""
+        metering = self.conf.get(CONF_METERING)
+        load_entity = self.conf[CONF_LOAD].get(CONF_ENERGY_ENTITY)
+        if not metering or not load_entity:
+            return
+        now = dt_util.utcnow()
+        imp_id = metering[CONF_GRID_IMPORT_ENTITY]
+        exp_id = metering[CONF_GRID_EXPORT_ENTITY]
+        pv_id = metering[CONF_PV_ENERGY_ENTITY]
+        energy = await self._slot_energy({imp_id, exp_id, pv_id, load_entity}, days, now)
+        imp, exp, pv, load = (energy.get(i, {}) for i in (imp_id, exp_id, pv_id, load_entity))
+        until = self.conf[CONF_PRICES].get(CONF_NET_METERING_UNTIL)
+        netted_until = datetime.combine(until, time(0), self.tz).timestamp() if until else None
+        slots: dict[int, tuple[float, float, float, float]] = {}
+        prices: dict[int, tuple[float, float]] = {}
+        for ts in set(imp) & set(exp) & set(load):
+            raw = self.price_history.get(ts)
+            if raw is None:
+                continue
+            slots[ts] = (imp[ts], exp[ts], load[ts], pv.get(ts, 0.0))
+            netted = netted_until is not None and ts < netted_until
+            prices[ts] = (float(self.tariff.import_price(raw)), float(self.tariff.export_value(raw, netted)))
+        grid_conf = self.conf[CONF_GRID]
+        # Twice the connection limits: higher readings are counter glitches.
+        max_load = self._max_load_slot_kwh
+        max_kwh = (
+            2 * grid_conf[CONF_IMPORT_LIMIT] * SLOT_HOURS,
+            2 * grid_conf[CONF_EXPORT_LIMIT] * SLOT_HOURS,
+            max_load,
+            max_load,
+        )
+        fresh = day_ledger(
+            slots,
+            prices,
+            self.tz,
+            grid_conf[CONF_EXPORT_LIMIT],
+            grid_conf[CONF_ALLOW_CURTAIL],
+            float(self.settings[SET_CYCLE_COST]),
+            max_kwh,
+        )
+        merge(self.ledger, fresh)
+        self.schedule_save()
+
+    def _pv_energy_entity(self) -> str | None:
+        return self.conf[CONF_SOLAR].get(CONF_ENERGY_ENTITY) or (self.conf.get(CONF_METERING) or {}).get(
+            CONF_PV_ENERGY_ENTITY
+        )
+
+    async def _sync_pv_actual(self, days: int) -> None:
+        """Read the metered PV yield and refit the PV forecast calibration."""
+        entity = self._pv_energy_entity()
+        if not entity:
+            return
+        now = dt_util.utcnow()
+        energy = (await self._slot_energy({entity}, days, now)).get(entity, {})
+        curtail = self.conf[CONF_GRID][CONF_ALLOW_CURTAIL]
+        for ts, kwh in energy.items():
+            # At negative prices the inverter may curtail: that is not the forecast's fault.
+            if curtail and self.price_history.get(ts, 0.0) < 0:
+                continue
+            self.pv_actual[ts] = kwh
+        cutoff = now.timestamp() - (PV_CALIBRATION_DAYS + 2) * 86400
+        self.pv_actual = {k: v for k, v in self.pv_actual.items() if k >= cutoff}
+        self.pv_forecast_log = {k: v for k, v in self.pv_forecast_log.items() if k >= cutoff}
+        self.pv_calibration = calibrate(self.pv_forecast_log, self.pv_actual, self.tz, now.astimezone(self.tz).date())
+
+    async def _slot_energy(self, ids: set[str], days: int, now: datetime) -> dict[str, dict[int, float]]:
+        """kWh per completed 15 minute slot from the recorder's energy statistics.
+
+        5-minute statistics where a slot has all of them (kept ~10 days),
+        otherwise the hourly statistics spread over four slots.
+        """
         start = now - timedelta(days=days)
-        ids = {entity, *load_conf[CONF_SUBTRACT_ENTITIES]}
         units = {"energy": UnitOfEnergy.KILO_WATT_HOUR}
         hourly = await self._statistics(start, now, ids, "hour", units, {"change"})
         short = await self._statistics(max(start, now - timedelta(days=9)), now, ids, "5minute", units, {"change"})
@@ -631,28 +785,12 @@ class EmsCoordinator(DataUpdateCoordinator[EmsData]):
             coarse = hour_slots.get(stat_id, {}).get(ts)
             return coarse[0] if coarse else None
 
-        keys = set(hour_slots.get(entity, {})) | set(fine_slots.get(entity, {}))
-        for ts in keys:
-            if ts >= current or self._load_excluded(ts):
-                continue
-            main = value(entity, ts)
-            if main is None:
-                continue
-            for sub in load_conf[CONF_SUBTRACT_ENTITIES]:
-                main -= value(sub, ts) or 0.0
-            main = max(0.0, main)
-            if plausible_load(main, self._max_load_slot_kwh):
-                self.load_history[ts] = main
-            else:
-                self.load_history.pop(ts, None)
-                self.rejected_load[ts] = main
-
-        cutoff = now.timestamp() - (load_conf[CONF_HISTORY_DAYS] + 1) * 86400
-        self.load_history = {k: v for k, v in self.load_history.items() if k >= cutoff}
-        self.rejected_load = {k: v for k, v in self.rejected_load.items() if k >= cutoff}
-        self.load_excluded = [(a, b) for a, b in self.load_excluded if b >= cutoff]
-        self._last_load_sync = now
-        self.schedule_save()
+        out: dict[str, dict[int, float]] = {}
+        for stat_id in ids:
+            keys = set(hour_slots.get(stat_id, {})) | set(fine_slots.get(stat_id, {}))
+            values = {ts: value(stat_id, ts) for ts in keys if ts < current}
+            out[stat_id] = {ts: v for ts, v in values.items() if v is not None}
+        return out
 
     async def _bootstrap_price_history(self) -> None:
         """Seed the price history from the hourly mean statistics of a price sensor.
@@ -784,7 +922,18 @@ class EmsCoordinator(DataUpdateCoordinator[EmsData]):
         p50, covered = integrate_to_slots([(s, e, p) for s, e, p, _, _ in points], slot_starts)
         p10, _ = integrate_to_slots([(s, e, p) for s, e, _, p, _ in points], slot_starts)
         weight = float(self.settings[SET_PV_PESSIMISM])
-        pv = ((1 - weight) * p50 + weight * p10) * self.conf[CONF_SOLAR][CONF_PV_SCALE]
+        scale = self.conf[CONF_SOLAR][CONF_PV_SCALE]
+        # Log the P50 for the coming day; what is left per slot once it has
+        # passed is compared with the metered yield (pv_calibration).
+        horizon = now + timedelta(days=1)
+        for i, start in enumerate(slot_starts):
+            if start >= horizon:
+                break
+            if covered[i] > 0:
+                self.pv_forecast_log[int(start.timestamp())] = float(p50[i] * scale)
+        pv = ((1 - weight) * p50 + weight * p10) * scale
+        if self.settings[SET_PV_CALIBRATION]:
+            pv = pv * slot_factors(self.pv_calibration, slot_starts, self.tz)
         pv[covered <= 0] = np.nan
         if np.isnan(pv).any():
             pv = fill_by_time_of_day(pv, slot_starts, self.tz, scale=0.8)
@@ -870,6 +1019,14 @@ class EmsCoordinator(DataUpdateCoordinator[EmsData]):
             except Exception as err:  # noqa: BLE001
                 warnings.append(f"load history: {err}")
                 self._last_load_sync = now
+            try:
+                await self._sync_metering(2)
+            except Exception as err:  # noqa: BLE001
+                warnings.append(f"realised savings: {err}")
+            try:
+                await self._sync_pv_actual(2)
+            except Exception as err:  # noqa: BLE001
+                warnings.append(f"PV calibration: {err}")
 
         count = self.conf[CONF_PLAN_DAYS] * 96
         slot_starts = slot_grid(now, count)
@@ -890,12 +1047,12 @@ class EmsCoordinator(DataUpdateCoordinator[EmsData]):
         if self.settings[SET_FORECAST_TRUST]:
             raw, skill_margin = self.price_skill.adjust(now.timestamp(), slot_ts, raw, firm, origin)
         imp = self.tariff.import_price(raw)
-        exp = self.tariff.export_price(raw)
+        netted = np.zeros(count, dtype=bool)
         if until := self.conf[CONF_PRICES].get(CONF_NET_METERING_UNTIL):
             # Net metering (salderen): export earns the import price until the end date.
             end = datetime.combine(until, time(0), self.tz)
             netted = np.array([s < end for s in slot_starts])
-            exp = np.where(netted, imp, exp)
+        exp = self.tariff.export_value(raw, netted)
         # The setting is the minimum margin; uncertain (far ahead) forecasts get more.
         margin = np.maximum(float(self.settings[SET_FORECAST_MARGIN]), skill_margin * (1 + self.tariff.vat))
         plain_imp = imp  # without the forecast margin, for the end-of-horizon value
@@ -934,6 +1091,19 @@ class EmsCoordinator(DataUpdateCoordinator[EmsData]):
                     flexible.append(load)
             else:
                 fixed_heavy += load.profile(slot_starts, self.tz)
+        live_kw = None
+        if self.conf[CONF_LOAD].get(CONF_POWER_ENTITY):
+            # What the house draws right now replaces the forecast for the
+            # current slot and fades back to it over the next hour. Heavy loads
+            # planned for now are part of the reading; later ones stay as planned.
+            live_kw = self.live_load.mean(now.timestamp())
+            if live_kw is None:
+                live_kw = self._live_power_now()
+            if live_kw is not None:
+                ahead = np.array([max((s - now).total_seconds(), 0.0) / 3600 for s in slot_starts])
+                house_kw = max(live_kw - fixed_heavy[0] / SLOT_HOURS, 0.0)
+                house = blend_live(house, ahead, house_kw, SLOT_HOURS)
+        self._live_kw = live_kw
         load = house + fixed_heavy
         load[0] *= fraction
         pv[0] *= fraction
@@ -1177,11 +1347,13 @@ class EmsCoordinator(DataUpdateCoordinator[EmsData]):
                 "today_remaining_kwh": round(float(inp.pv_kwh[today_mask].sum()), 2),
                 "days": per_day(inp.pv_kwh),
                 "source_updated": self.solar.fetched_at.isoformat() if self.solar.fetched_at else None,
+                "calibration": {**self.pv_calibration, "enabled": bool(self.settings[SET_PV_CALIBRATION])},
             },
             load={
                 "today_remaining_kwh": round(float(total_load[today_mask].sum()), 2),
                 "days": per_day(total_load),
                 "history_days": self._history_days,
+                "live_kw": round(self._live_kw, 2) if self._live_kw is not None else None,
                 "rejected_readings": len(self.rejected_load),
                 "excluded_periods": [
                     {
@@ -1194,6 +1366,7 @@ class EmsCoordinator(DataUpdateCoordinator[EmsData]):
             heavy_loads=heavy,
             manual_slots=[s.to_dict() for s in self.manual_slots],
             warnings=warnings,
+            realised=summary(self.ledger, local_today.isoformat()) if self.conf.get(CONF_METERING) else {},
         )
 
     def _current_slot(self, plan: PlanResult, slot_starts, capacity: float, inp: PlanInput) -> dict:

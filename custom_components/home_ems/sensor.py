@@ -12,7 +12,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 from homeassistant.util import dt as dt_util
 
-from .const import DOMAIN
+from .const import CONF_METERING, DOMAIN
 from .coordinator import EmsCoordinator, EmsData
 from .entity import EmsEntity
 from .optimizer import MODE_CHARGE, MODES
@@ -45,6 +45,8 @@ async def async_setup_platform(
     ]
     if coordinator.ev_conf:
         entities.append(EvSensor(coordinator))
+    if coordinator.conf.get(CONF_METERING):
+        entities.append(RealisedSavingsSensor(coordinator))
     async_add_entities(entities)
 
 
@@ -97,7 +99,9 @@ class PlanSensor(_DataSensor):
     def extra_state_attributes(self) -> dict[str, Any]:
         if not self.data:
             return {}
-        return {**self.data.totals, "days": self.data.days, "slots": self.data.slots}
+        realised = self.data.realised.get("total") if self.data.realised else None
+        extra = {"realised_savings": realised["savings"], "realised_since": self.data.realised["since"]} if realised else {}
+        return {**self.data.totals, **extra, "days": self.data.days, "slots": self.data.slots}
 
 
 class TargetSocSensor(_DataSensor):
@@ -170,6 +174,34 @@ class SavingsSensor(_DataSensor):
             **{k: t[k] for k in keys},
             "note": f"{self.NOTES[self.key]}; net of battery wear, energy left in the battery "
             "at the end valued at terminal_value",
+        }
+
+
+class RealisedSavingsSensor(_DataSensor):
+    """What the battery really saved so far: metered cost versus the same load and PV without it."""
+
+    _attr_native_unit_of_measurement = "EUR"
+    _attr_device_class = SensorDeviceClass.MONETARY
+    _attr_state_class = SensorStateClass.TOTAL
+    _unrecorded_attributes = frozenset({"days"})
+
+    def __init__(self, coordinator: EmsCoordinator) -> None:
+        super().__init__(coordinator, "realised_savings", "Realised savings", "mdi:cash-check")
+
+    @property
+    def native_value(self) -> float | None:
+        if not self.data or not self.data.realised:
+            return None
+        return self.data.realised["total"]["savings"]
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        if not self.data or not self.data.realised:
+            return {}
+        return {
+            **self.data.realised,
+            "note": "metered cost versus the same load and PV without a battery, priced per 15 minutes; "
+            "includes battery and inverter losses, not wear (see wear)",
         }
 
 

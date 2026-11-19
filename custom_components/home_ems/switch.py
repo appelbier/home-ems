@@ -14,6 +14,7 @@ from .const import (
     SET_CONTROL_ENABLED,
     SET_EV_ALLOW_BATTERY,
     SET_FORECAST_TRUST,
+    SET_PV_CALIBRATION,
 )
 from .coordinator import EmsCoordinator
 from .entity import EmsSettingEntity
@@ -24,6 +25,7 @@ SWITCHES = (
     (SET_ALLOW_BATTERY_EXPORT, "Allow battery export", "mdi:transmission-tower-export", False),
     (SET_EV_ALLOW_BATTERY, "EV may use house battery", "mdi:car-battery", True),
     (SET_FORECAST_TRUST, "Automatic forecast trust", "mdi:chart-bell-curve-cumulative", False),
+    (SET_PV_CALIBRATION, "Automatic PV calibration", "mdi:solar-power-variant", False),
 )
 
 

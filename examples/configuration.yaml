@@ -78,8 +78,16 @@ home_ems:
   load:
     energy_entity: sensor.house_consumption_energy     # kWh, total_increasing
     subtract_entities: [sensor.ev_charger_energy]      # planned separately
+    # power_entity: sensor.house_power                 # W or kW: corrects the next hour for what runs now
+    # subtract_power_entities: [sensor.ev_charger_power]
     history_days: 28
     default_daily_kwh: 15
+
+  # Optional: realised cost and savings from your meters (kWh, total_increasing).
+  # metering:
+  #   grid_import_entity: sensor.grid_import_energy
+  #   grid_export_entity: sensor.grid_export_energy
+  #   pv_energy_entity: sensor.pv_energy
 
   ev:
     connected_entity: binary_sensor.wallbox_car_connected

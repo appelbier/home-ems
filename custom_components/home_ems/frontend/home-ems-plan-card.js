@@ -11,7 +11,7 @@
  * Served by the integration itself; no dashboard resource needed.
  */
 
-const CARD_VERSION = "0.3.1";
+const CARD_VERSION = "0.3.2";
 
 const MODES = {
   charge: { color: "#1e88e5", icon: "mdi:battery-arrow-up" },
@@ -35,6 +35,8 @@ const TEXT = {
     now: "Now", soc_now: "SoC", savings: "Savings", battery_savings: "Battery total", plan_cost: "Plan cost", end_soc: "End SoC",
     savings_hint: "Smart plan versus plain self consumption with the same battery, net of wear and energy left at the end",
     battery_hint: "Plan versus no battery at all, net of wear and energy left at the end",
+    realised: "Realised",
+    realised_hint: "Really saved since {since}: metered cost versus the same load and PV without a battery (losses included, wear not)",
     firm_until: "Prices fixed until", forecast: "forecast price", manual: "manual slot",
     curtail: "PV curtailed", charged: "charge", exported: "export", min: "min", heavy: "heavy load",
     no_plan: "No plan yet: waiting for Home EMS.", missing: "Entity not found",
@@ -49,6 +51,8 @@ const TEXT = {
     now: "Nu", soc_now: "SoC", savings: "Besparing", battery_savings: "Accu totaal", plan_cost: "Plankosten", end_soc: "Eind-SoC",
     savings_hint: "Slim plan tegenover gewoon zelfverbruik met dezelfde accu, na slijtage en inclusief de energie die aan het eind nog in de accu zit",
     battery_hint: "Plan tegenover helemaal geen accu, na slijtage en inclusief de energie die aan het eind nog in de accu zit",
+    realised: "Gerealiseerd",
+    realised_hint: "Werkelijk bespaard sinds {since}: gemeten kosten tegenover hetzelfde verbruik en dezelfde zon zonder accu (verliezen meegerekend, slijtage niet)",
     firm_until: "Prijzen vast tot", forecast: "voorspelde prijs", manual: "handmatig slot",
     curtail: "PV afgeregeld", charged: "laden", exported: "terug", min: "min", heavy: "zware last",
     no_plan: "Nog geen plan: wacht op Home EMS.", missing: "Entiteit niet gevonden",
@@ -331,6 +335,9 @@ class HomeEmsPlanCard extends HTMLElement {
     if (a.savings !== undefined && a.savings !== null) items.push(this._stat(t.savings, this._money(a.savings), t.savings_hint));
     if (a.battery_savings !== undefined && a.battery_savings !== null) {
       items.push(this._stat(t.battery_savings, this._money(a.battery_savings), t.battery_hint));
+    }
+    if (a.realised_savings !== undefined && a.realised_savings !== null) {
+      items.push(this._stat(t.realised, this._money(a.realised_savings), t.realised_hint.replace("{since}", a.realised_since || "?")));
     }
     if (a.plan_cost !== undefined) items.push(this._stat(t.plan_cost, this._money(a.plan_cost)));
     if (a.final_soc !== undefined) items.push(this._stat(t.end_soc, `${this._num(a.final_soc, 0)}%`));

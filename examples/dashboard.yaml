@@ -38,6 +38,25 @@ views:
             entity: sensor.home_ems_planned_savings
           - type: tile
             entity: sensor.home_ems_battery_savings
+          # Needs the metering: block (realised cost from your energy meters).
+          - type: tile
+            entity: sensor.home_ems_realised_savings
+          - type: markdown
+            content: |
+              {% set r = state_attr('sensor.home_ems_realised_savings', 'today') %}
+              {% if r %}
+              {% set w = state_attr('sensor.home_ems_realised_savings', 'last_7_days') %}
+              {% set m = state_attr('sensor.home_ems_realised_savings', 'last_30_days') %}
+              {% set t = state_attr('sensor.home_ems_realised_savings', 'total') %}
+              **Realised** (since {{ state_attr('sensor.home_ems_realised_savings', 'since') }})
+              | | Saved | Paid | Without battery |
+              |---|---:|---:|---:|
+              | Today | €{{ '%.2f' % r.savings }} | €{{ '%.2f' % r.actual_cost }} | €{{ '%.2f' % r.no_battery_cost }} |
+              | 7 days | €{{ '%.2f' % w.savings }} | €{{ '%.2f' % w.actual_cost }} | €{{ '%.2f' % w.no_battery_cost }} |
+              | 30 days | €{{ '%.2f' % m.savings }} | €{{ '%.2f' % m.actual_cost }} | €{{ '%.2f' % m.no_battery_cost }} |
+              | Total | €{{ '%.2f' % t.savings }} | €{{ '%.2f' % t.actual_cost }} | €{{ '%.2f' % t.no_battery_cost }} |
+              {% if t.rejected_slots %}_{{ t.rejected_slots }} impossible meter readings (quarter hours) left out_{% endif %}
+              {% endif %}
           - type: tile
             entity: sensor.home_ems_import_price
           - type: tile
@@ -210,8 +229,13 @@ views:
             entities:
               - number.home_ems_pv_pessimism
               - number.home_ems_load_margin
+              - switch.home_ems_automatic_pv_calibration
           - type: markdown
             content: |
+              {% set c = state_attr('sensor.home_ems_pv_forecast', 'calibration') %}
+              {% if c %}**PV calibration**: ×{{ '%.2f' % c.factor }} over {{ c.days }} days{% if c.days < 3 %} (learning, needs 3 days){% endif %}
+              {% if c.forecast_kwh is defined %}(forecast {{ c.forecast_kwh }} kWh, metered {{ c.actual_kwh }} kWh){% endif %}
+              {% endif %}
               | Day | PV | Load | EV | Cost | End SoC |
               |---|---:|---:|---:|---:|---:|
               {% for d in state_attr('sensor.home_ems_plan', 'days') or [] -%}

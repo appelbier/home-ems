@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, time, timedelta, timezone
+import math
 from pathlib import Path
 import sys
 from zoneinfo import ZoneInfo
@@ -482,3 +483,120 @@ def test_trading_aggressiveness_scales_from_self_consumption_to_full_trading():
     assert set(conservative.mode) == {"self_consumption"}
     assert np.allclose(conservative.soc_kwh, simulate_self_consumption(inp, bat, GRID).soc_kwh, atol=0.3)
     assert trade_hurdle(100) == 0.0 and trade_hurdle(50) == pytest.approx(0.10)
+
+
+def test_ledger_prices_metered_energy_against_no_battery():
+    from home_ems.ledger import day_ledger, merge, summary
+
+    day = datetime(2026, 11, 18, tzinfo=TZ)
+    night = int(day.replace(hour=2).timestamp())
+    evening = int(day.replace(hour=19).timestamp())
+    noon = int(day.replace(hour=12).timestamp())
+    energy = {
+        night: (3.0, 0.0, 0.5, 0.0),  # house 0.5 kWh, battery charged 2.5 kWh from the grid
+        evening: (0.0, 1.0, 1.0, 0.0),  # house 1 kWh and 1 kWh export, both from the battery
+        noon: (0.0, 0.5, 0.2, 1.5),  # PV 1.5: 0.2 house, 0.8 into the battery, 0.5 exported
+    }
+    prices = {night: (0.30, 0.30), evening: (0.50, 0.50), noon: (0.40, 0.40)}
+    days = day_ledger(energy, prices, TZ, export_limit_kw=10, cycle_cost=0.01)
+    d = days["2026-11-18"]
+    assert d["actual_cost"] == pytest.approx(3.0 * 0.30 - 1.0 * 0.50 - 0.5 * 0.40)
+    assert d["no_battery_cost"] == pytest.approx(0.5 * 0.30 + 1.0 * 0.50 - 1.3 * 0.40)
+    assert d["savings"] == pytest.approx(d["no_battery_cost"] - d["actual_cost"])
+    assert d["battery_kwh"] == pytest.approx(2.5 + 2.0 + 0.8)
+    assert d["wear"] == pytest.approx(0.01 * 5.3)
+    assert d["slots"] == 3
+
+    ledger = {"2026-11-17": {"savings": 1.0, "actual_cost": 2.0, "no_battery_cost": 3.0, "wear": 0.1, "slots": 96}}
+    merge(ledger, days)
+    merge(ledger, {"2026-11-17": {"savings": 0.2, "slots": 10}})  # partial re-read keeps the full day
+    assert ledger["2026-11-17"]["savings"] == 1.0
+    s = summary(ledger, "2026-11-18")
+    assert s["since"] == "2026-11-17" and s["total"]["days"] == 2
+    assert s["total"]["savings"] == pytest.approx(1.0 + d["savings"], abs=0.01)
+    assert s["today"]["savings"] == pytest.approx(d["savings"], abs=0.01)
+
+
+def test_live_power_average_and_fade():
+    from home_ems.live import LiveAverage, blend_live, to_kw
+
+    live = LiveAverage(window_s=300)
+    live.add(0, 1.0)
+    live.add(200, 7.0)  # oven on for the last 100 s of the window
+    assert live.mean(300) == pytest.approx((1.0 * 200 + 7.0 * 100) / 300)
+    live.add(400, 7.0)
+    assert live.mean(600) == pytest.approx(7.0)  # the old 1 kW sample has left the window
+    assert LiveAverage().mean(0) is None
+
+    forecast = np.full(9, 0.25)  # 1 kW
+    ahead = np.arange(9) * 0.25
+    out = blend_live(forecast, ahead, live_kw=7.0, slot_hours=0.25)
+    assert out[0] == pytest.approx(1.75)  # now: the live 7 kW
+    assert out[0] > out[2] > out[4] > out[8] > 0.25  # fades back towards the forecast
+    assert out[8] < 0.4  # two hours ahead: ~7 % of the difference left
+
+    assert to_kw(6500, "W") == 6.5 and to_kw(6.5, "kW") == 6.5 and to_kw(6500, None) == 6.5
+
+
+def test_pv_calibration_learns_a_consistent_bias_per_hour():
+    from home_ems.pv_calibration import calibrate, slot_factors
+
+    today = datetime(2026, 11, 20).date()
+    forecast, actual = {}, {}
+    for d in range(1, 11):
+        day = datetime.combine(today - timedelta(days=d), time(0), TZ)
+        for q in range(96):
+            start = day + q * SLOT
+            hour = start.hour + start.minute / 60
+            fc = max(0.0, math.sin(math.pi * (hour - 8) / 9)) * 1.0 if 8 < hour < 17 else 0.0
+            ts = int(start.timestamp())
+            forecast[ts] = fc
+            ratio = 0.5 if hour < 10 else 0.8  # a tree shades the morning, the rest is 20 % low
+            actual[ts] = 0.0 if d == 3 else fc * ratio  # day 3: snow on the panels
+    cal = calibrate(forecast, actual, TZ, today)
+    assert cal["days"] == 9  # the snow day is left out
+    assert 0.78 < cal["factor"] < 0.87  # 0.8, shrunk a little towards 1 with 9 days
+    assert cal["hours"][9] < 0.65 and 0.75 < cal["hours"][13] < 0.85
+    assert cal["hours"][2] == pytest.approx(cal["factor"], abs=0.01)  # no sun at night: the overall factor
+
+    few = calibrate({k: v for k, v in forecast.items() if k > int(datetime.combine(today - timedelta(days=2), time(0), TZ).timestamp())}, actual, TZ, today)
+    assert few["factor"] == 1.0 and few["days"] < 3
+    slots = [datetime.combine(today, time(9), TZ), datetime.combine(today, time(13), TZ)]
+    assert list(slot_factors(cal, slots, TZ)) == [cal["hours"][9], cal["hours"][13]]
+
+
+def test_ledger_leaves_out_meter_glitches():
+    from home_ems.ledger import day_ledger, merge, summary
+
+    day = datetime(2026, 11, 18, tzinfo=TZ)
+    good = int(day.replace(hour=2).timestamp())
+    glitch = int(day.replace(hour=3).timestamp())
+    reset = int(day.replace(hour=4).timestamp())
+    energy = {
+        good: (1.0, 0.0, 1.0, 0.0),
+        glitch: (13237.0, 0.0, 1.0, 0.0),  # import counter reset: its whole total in one slot
+        reset: (0.5, -40.0, 0.5, 0.0),  # a counter that went backwards
+    }
+    prices = {ts: (0.40, 0.40) for ts in energy}
+    limits = (2 * 17 * 0.25, 2 * 15 * 0.25, 30 * 0.25, 30 * 0.25)
+    d = day_ledger(energy, prices, TZ, export_limit_kw=15, max_kwh=limits)["2026-11-18"]
+    assert d["slots"] == 1 and d["rejected"] == 2
+    assert d["actual_cost"] == pytest.approx(0.40)
+
+    # A stored day with the glitch in it is replaced by the filtered recomputation.
+    ledger = {"2026-11-18": {"savings": -5000.0, "actual_cost": 5295.0, "no_battery_cost": 0.4, "slots": 3}}
+    merge(ledger, {"2026-11-18": d})
+    assert ledger["2026-11-18"]["actual_cost"] == pytest.approx(0.40)
+    assert summary(ledger, "2026-11-18")["total"]["rejected_slots"] == 2
+
+
+def test_export_bonus_on_the_market_price():
+    t = Tariff(vat=0.21, energy_tax=0.0916, import_markup=0.02, export_bonus=0.10)
+    raw = np.array([0.25, -0.05])
+    netted = t.export_value(raw, netted=True)
+    # Salderen: the import price plus 10 % of the market price, with VAT; nothing on a negative price.
+    assert netted[0] == pytest.approx(t.import_price(0.25) + 0.10 * 0.25 * 1.21)
+    assert netted[1] == pytest.approx(t.import_price(-0.05))
+    after = t.export_value(raw, netted=False)
+    assert after[0] == pytest.approx(0.25 + 0.025)  # raw export, no VAT
+    assert Tariff().export_value(0.25, True) == pytest.approx(Tariff().import_price(0.25))
